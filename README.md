@@ -6,6 +6,7 @@
 The goal of the project is to populate the hx-vals attribute in [templ](https://github.com/a-h/templ) projects. Inspired by [slog](https://pkg.go.dev/log/slog), you can pass strings, maps, and `jts.Input`.
 
 > ![WARNING]
+>
 > It is not recommended to use nested entities.
 
 ## Installation
