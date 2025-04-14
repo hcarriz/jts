@@ -3,6 +3,7 @@ package jts_test
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"testing"
 
 	"github.com/hcarriz/jts"
@@ -197,6 +198,29 @@ func TestNew(t *testing.T) {
 				},
 			},
 			want:    `{"key":["","value","value2"]}`,
+			wantErr: false,
+		},
+		{
+			name: "nil value 8",
+			args: args{
+				in: []any{
+					map[string]any{"key": nil},
+					jts.Pair("key", "value"),
+					"key", "value2",
+					url.Values{"key": []string{"value3"}},
+				},
+			},
+			want:    `{"key":["","value","value2","value3"]}`,
+			wantErr: false,
+		},
+		{
+			name: "empty url values",
+			args: args{
+				in: []any{
+					url.Values{},
+				},
+			},
+			want:    `{}`,
 			wantErr: false,
 		},
 	}

@@ -2,6 +2,7 @@ package jts
 
 import (
 	"encoding/json"
+	"net/url"
 	"reflect"
 )
 
@@ -41,6 +42,8 @@ func argsToInput(args []any) (Input, []any) {
 		return mapToInput(x, args)
 	case []any:
 		return argsToInput(x)
+	case url.Values:
+		return mapToInput(x, args)
 	default:
 		return Pair(BadKey, x), args[1:]
 	}
