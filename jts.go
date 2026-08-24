@@ -1,18 +1,27 @@
 package jts
 
 import (
+	"encoding"
 	"encoding/json"
 	"net/url"
 	"reflect"
 )
 
+// BadKey is the key used for a trailing string or an unsupported standalone
+// input. It is an ordinary key, so generated and explicit BadKey values combine
+// using the same duplicate-key rules as any other key.
 const BadKey = "!INVALID"
 
+// Input is an opaque key/value pair consumed by [Convert] and [New]. Construct
+// values with [Pair]. The zero value is valid and is ignored.
 type Input struct {
 	key   string
 	value any
 }
 
+// Pair returns an Input containing key and value. An Input with an empty key is
+// consumed but omitted by [Convert] and [New]. Values retain their encoding/json
+// representation unless duplicate-key array concatenation combines them.
 func Pair[T any](key string, value T) Input {
 	return Input{
 		key:   key,
@@ -20,126 +29,204 @@ func Pair[T any](key string, value T) Input {
 	}
 }
 
-func argsToInput(args []any) (Input, []any) {
+type sliceID struct {
+	data uintptr
+	len  int
+	cap  int
+}
+
+type argumentFrame struct {
+	args    []any
+	index   int
+	id      sliceID
+	tracked bool
+}
+
+type argumentReader struct {
+	frames []argumentFrame
+	active map[sliceID]struct{}
+}
+
+func newArgumentReader(args []any) *argumentReader {
+	r := &argumentReader{active: make(map[sliceID]struct{})}
+	r.push(args, true)
+	return r
+}
+
+func (r *argumentReader) nextInput() (Input, bool) {
+	for {
+		value, ok := r.next()
+		if !ok {
+			return Input{}, false
+		}
+
+		switch value := value.(type) {
+		case string:
+			paired, ok := r.next()
+			if !ok {
+				return Pair(BadKey, value), true
+			}
+			return Pair(value, paired), true
+		case Input:
+			return value, true
+		case map[string][]any:
+			r.push(mapInputs(value), false)
+		case map[string]any:
+			r.push(mapInputs(value), false)
+		case map[string]string:
+			r.push(mapInputs(value), false)
+		case map[string][]string:
+			r.push(mapInputs(value), false)
+		case []any:
+			if !r.push(value, true) {
+				return Pair(BadKey, value), true
+			}
+		case url.Values:
+			r.push(mapInputs(value), false)
+		default:
+			return Pair(BadKey, value), true
+		}
+	}
+}
+
+func (r *argumentReader) next() (any, bool) {
+	for len(r.frames) > 0 {
+		last := len(r.frames) - 1
+		frame := &r.frames[last]
+		if frame.index < len(frame.args) {
+			value := frame.args[frame.index]
+			frame.index++
+			return value, true
+		}
+
+		if frame.tracked {
+			delete(r.active, frame.id)
+		}
+		r.frames = r.frames[:last]
+	}
+
+	return nil, false
+}
+
+func (r *argumentReader) push(args []any, track bool) bool {
 	if len(args) == 0 {
-		return Input{}, nil
+		return true
 	}
-	switch x := args[0].(type) {
-	case string:
-		if len(args) == 1 {
-			return Pair(BadKey, x), nil
+
+	frame := argumentFrame{args: args}
+	if track {
+		frame.id = identifySlice(args)
+		if _, exists := r.active[frame.id]; exists {
+			return false
 		}
-		return Pair(x, args[1]), args[2:]
-	case Input:
-		return x, args[1:]
-	case map[string][]any:
-		return mapToInput(x, args)
-	case map[string]any:
-		return mapToInput(x, args)
-	case map[string]string:
-		return mapToInput(x, args)
-	case map[string][]string:
-		return mapToInput(x, args)
-	case []any:
-		return argsToInput(x)
-	case url.Values:
-		return mapToInput(x, args)
-	default:
-		return Pair(BadKey, x), args[1:]
+		frame.tracked = true
+		r.active[frame.id] = struct{}{}
+	}
+
+	r.frames = append(r.frames, frame)
+	return true
+}
+
+func identifySlice(value []any) sliceID {
+	return sliceID{
+		data: reflect.ValueOf(value).Pointer(),
+		len:  len(value),
+		cap:  cap(value),
 	}
 }
 
-func mapToInput[T any](in map[string]T, args []any) (Input, []any) {
-	var list []any
-	for key, value := range in {
+func mapInputs[T any](values map[string]T) []any {
+	inputs := make([]any, 0, len(values))
+	for key, value := range values {
 		if key != "" {
-			list = append(list, Pair(key, value))
+			inputs = append(inputs, Pair(key, value))
 		}
 	}
-	if x := args[1:]; len(x) > 0 {
-		return Input{}, append(list, x)
-	} else {
-		return Input{}, list
-
-	}
+	return inputs
 }
 
+// Convert processes in as the compatibility input forms described in the
+// package documentation and returns a non-nil map. Duplicate values are combined
+// in encounter order. Arrays concatenate when duplicate keys are combined;
+// supplied maps and structs remain values and are never deep-merged.
+//
+// Convert does not validate that values can be encoded as JSON. Use [New] when a
+// JSON string and encoding errors are required. The returned map has unspecified
+// iteration order.
 func Convert(in ...any) map[string]any {
-
 	list := make(map[string]any)
+	reader := newArgumentReader(in)
 
-	var a Input
-
-	for len(in) > 0 {
-		a, in = argsToInput(in)
-		if a.key == "" {
+	for {
+		input, ok := reader.nextInput()
+		if !ok {
+			return list
+		}
+		if input.key == "" {
 			continue
 		}
 
-		// Check if the key already exists in the map.
-		if existing, ok := list[a.key]; ok {
-			var slice []any
-			// Convert existing value into a slice if it isn't already one.
-			existingKind := reflect.TypeOf(existing).Kind()
-			if existingKind != reflect.Slice && existingKind != reflect.Array {
-				slice = []any{existing}
-			} else {
-				// Try to assert directly to []any.
-				if s, ok := existing.([]any); ok {
-					slice = s
-				} else {
-					v := reflect.ValueOf(existing)
-					slice = make([]any, v.Len())
-					for i := 0; i < v.Len(); i++ {
-						slice[i] = v.Index(i).Interface()
-					}
-				}
-			}
-
-			// Check if the new value is an array/slice.
-			if a.value != nil {
-
-				newValType := reflect.TypeOf(a.value)
-				if newValType.Kind() == reflect.Slice || newValType.Kind() == reflect.Array {
-					v := reflect.ValueOf(a.value)
-					for i := 0; i < v.Len(); i++ {
-						slice = append(slice, v.Index(i).Interface())
-					}
-				} else {
-					slice = append(slice, a.value)
-				}
-				list[a.key] = slice
-			}
-		} else {
-			// If key doesn't exist, check if the value is an array/slice and convert it.
-
-			if a.value != nil {
-
-				valType := reflect.TypeOf(a.value)
-				if valType.Kind() == reflect.Slice || valType.Kind() == reflect.Array {
-					v := reflect.ValueOf(a.value)
-					arr := make([]any, v.Len())
-					for i := 0; i < v.Len(); i++ {
-						arr[i] = v.Index(i).Interface()
-					}
-					list[a.key] = arr
-				} else {
-					list[a.key] = a.value
-				}
-
-			} else {
-				list[a.key] = ""
-			}
-		}
+		addValue(list, input.key, input.value)
 	}
-
-	return list
-
 }
 
-func New(in ...any) (string, error) {
+func addValue(values map[string]any, key string, value any) {
+	existing, duplicate := values[key]
+	if !duplicate {
+		values[key] = value
+		return
+	}
 
-	result, err := json.Marshal(Convert(in))
+	combined := appendDuplicateValue(nil, existing)
+	values[key] = appendDuplicateValue(combined, value)
+}
+
+func appendDuplicateValue(values []any, value any) []any {
+	if !concatenatesOnDuplicate(value) {
+		return append(values, value)
+	}
+
+	reflected := reflect.ValueOf(value)
+	for i := range reflected.Len() {
+		values = append(values, reflected.Index(i).Interface())
+	}
+	return values
+}
+
+func concatenatesOnDuplicate(value any) bool {
+	if value == nil {
+		return false
+	}
+	if _, ok := value.(json.Marshaler); ok {
+		return false
+	}
+	if _, ok := value.(encoding.TextMarshaler); ok {
+		return false
+	}
+
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Array:
+		return true
+	case reflect.Slice:
+		if reflected.IsNil() || reflected.Type().Elem().Kind() == reflect.Uint8 {
+			return false
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+// New converts in with [Convert] and marshals the result as compact JSON. It is
+// the primary API for producing a templ dynamic value for an htmx hx-vals
+// attribute.
+//
+// If encoding/json cannot marshal a value, New returns an empty string and that
+// error. New does not mark its result as trusted HTML or JavaScript; callers must
+// preserve templ's normal dynamic-attribute escaping.
+func New(in ...any) (string, error) {
+	result, err := json.Marshal(Convert(in...))
 	if err != nil {
 		return "", err
 	}

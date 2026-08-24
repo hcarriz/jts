@@ -125,71 +125,71 @@ func TestNew(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "nil value",
+			name: "nil value is null",
 			args: args{
 				in: []any{
 					map[string]any{"key": nil},
 				},
 			},
-			want:    `{"key":""}`,
+			want:    `{"key":null}`,
 			wantErr: false,
 		},
 		{
-			name: "nil value 2",
+			name: "duplicate nil is retained",
 			args: args{
 				in: []any{
 					jts.Pair("key", "value"),
 					map[string]any{"key": nil},
 				},
 			},
-			want:    `{"key":"value"}`,
+			want:    `{"key":["value",null]}`,
 			wantErr: false,
 		},
 		{
-			name: "nil value 3",
+			name: "typed nil slice is null",
 			args: args{
 				in: []any{
 					map[string][]any{"key": nil},
 				},
 			},
-			want:    `{"key":[]}`,
+			want:    `{"key":null}`,
 			wantErr: false,
 		},
 		{
-			name: "nil value 4",
+			name: "duplicate typed nil slice is retained",
 			args: args{
 				in: []any{
 					jts.Pair("key", "value"),
 					map[string][]any{"key": nil},
 				},
 			},
-			want:    `{"key":["value"]}`,
+			want:    `{"key":["value",null]}`,
 			wantErr: false,
 		},
 		{
-			name: "nil value 5",
+			name: "typed nil slice before scalar is retained",
 			args: args{
 				in: []any{
 					map[string][]any{"key": nil},
 					jts.Pair("key", "value"),
 				},
 			},
-			want:    `{"key":["value"]}`,
+			want:    `{"key":[null,"value"]}`,
 			wantErr: false,
 		},
 		{
-			name: "nil value 6",
+			name: "nil before scalar is retained",
 			args: args{
 				in: []any{
 					map[string]any{"key": nil},
 					jts.Pair("key", "value"),
 				},
 			},
-			want:    `{"key":["","value"]}`,
+			want:    `{"key":[null,"value"]}`,
 			wantErr: false,
 		},
 		{
-			name: "nil value 7",
+			name: "nil retains duplicate order",
 			args: args{
 				in: []any{
 					map[string]any{"key": nil},
@@ -197,11 +197,11 @@ func TestNew(t *testing.T) {
 					"key", "value2",
 				},
 			},
-			want:    `{"key":["","value","value2"]}`,
+			want:    `{"key":[null,"value","value2"]}`,
 			wantErr: false,
 		},
 		{
-			name: "nil value 8",
+			name: "nil and url values retain duplicate order",
 			args: args{
 				in: []any{
 					map[string]any{"key": nil},
@@ -210,7 +210,7 @@ func TestNew(t *testing.T) {
 					url.Values{"key": []string{"value3"}},
 				},
 			},
-			want:    `{"key":["","value","value2","value3"]}`,
+			want:    `{"key":[null,"value","value2","value3"]}`,
 			wantErr: false,
 		},
 		{
@@ -238,39 +238,60 @@ func TestNew(t *testing.T) {
 	}
 }
 
-// FuzzNew fuzzes the New function by converting random byte slices into a set of inputs.
+// FuzzNew exercises scalar, duplicate, nested, nil, map, slice, and byte values.
 func FuzzNew(f *testing.F) {
-	// Seed corpus: various byte slices to start with.
 	f.Add([]byte("a"))
 	f.Add([]byte("keyvalue"))
 	f.Add([]byte{0, 1, 2, 3, 4, 5})
 
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Build a slice of inputs.
-		// Even indices are used as keys (as one-character strings).
-		// Odd indices are used as values; even bytes become an array, odd bytes a simple integer.
 		var inputs []any
 		for i, b := range data {
 			if i%2 == 0 {
-				// Use the byte as a key (a string). Note: empty string keys will be skipped.
 				inputs = append(inputs, string([]byte{b}))
-			} else {
-				// For the value, sometimes create a slice (if b is even) or a single integer.
-				if b%2 == 0 {
-					inputs = append(inputs, []int{int(b), int(b + 1)})
-				} else {
-					inputs = append(inputs, int(b))
-				}
+				continue
+			}
+
+			switch b % 7 {
+			case 0:
+				inputs = append(inputs, nil)
+			case 1:
+				inputs = append(inputs, []int{int(b), int(b + 1)})
+			case 2:
+				inputs = append(inputs, map[string]any{"byte": b, "nil": nil})
+			case 3:
+				inputs = append(inputs, [][]int{{int(b)}, {int(b + 1)}})
+			case 4:
+				inputs = append(inputs, []byte{b})
+			case 5:
+				inputs = append(inputs, struct {
+					Value byte `json:"value"`
+				}{Value: b})
+			default:
+				inputs = append(inputs, int(b))
 			}
 		}
 
-		// Call the function under test.
-		result, err := jts.New(inputs...)
+		callArgs := []any{[]any{inputs}, "tail", map[string]any{"nested": data}}
+		wantErr := len(data) > 0 && data[0]%11 == 0
+		if wantErr {
+			callArgs = append(callArgs, jts.Pair("marshal_error", failingMarshaler{}))
+		}
+
+		result, err := jts.New(callArgs...)
+		if wantErr {
+			if err == nil {
+				t.Fatalf("New returned nil error for a failing custom marshaler")
+			}
+			if result != "" {
+				t.Fatalf("New returned %q with a marshaling error, want empty string", result)
+			}
+			return
+		}
 		if err != nil {
 			t.Fatalf("New returned error: %v", err)
 		}
 
-		// Verify the result is valid JSON.
 		var m map[string]any
 		if err := json.Unmarshal([]byte(result), &m); err != nil {
 			t.Fatalf("Result is not valid JSON: %v", err)
@@ -279,56 +300,78 @@ func FuzzNew(f *testing.F) {
 }
 
 func ExampleNew() {
-
-	result, _ := jts.New("key", "value", "jump", true)
+	result, err := jts.New("key", "value", "jump", true)
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
 	fmt.Println(result)
 	// Output:
 	// {"jump":true,"key":"value"}
-
 }
 
 func ExampleNew_pair() {
-	result, _ := jts.New(jts.Pair("key", "value"))
+	result, err := jts.New(jts.Pair("key", "value"))
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
 	fmt.Println(result)
 	// Output:
 	// {"key":"value"}
 }
 
 func ExampleNew_mapWithSlice() {
-	result, _ := jts.New(map[string][]string{"names": {"john", "jane"}})
+	result, err := jts.New(map[string][]string{"names": {"john", "jane"}})
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
 	fmt.Println(result)
 	// Output:
 	// {"names":["john","jane"]}
 }
 
 func ExampleNew_map() {
-	result, _ := jts.New(map[string]string{"name": "john"})
+	result, err := jts.New(map[string]string{"name": "john"})
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
 	fmt.Println(result)
 	// Output:
 	// {"name":"john"}
 }
 
 func ExampleNew_mix() {
-	result, _ := jts.New(map[string][]string{"names": {"john", "jane"}}, jts.Pair("key", "value"), "key", "value2")
+	result, err := jts.New(map[string][]string{"names": {"john", "jane"}}, jts.Pair("key", "value"), "key", "value2")
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
 	fmt.Println(result)
 	// Output:
 	// {"key":["value","value2"],"names":["john","jane"]}
 }
 
 func ExampleNew_multipleKeys() {
-
-	result, _ := jts.New("key", "value", "jump", true, "key", "value2")
+	result, err := jts.New("key", "value", "jump", true, "key", "value2")
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
 	fmt.Println(result)
 	// Output:
 	// {"jump":true,"key":["value","value2"]}
-
 }
 
 func ExampleNew_singleValue() {
-
-	result, _ := jts.New("value")
+	result, err := jts.New("value")
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
 	fmt.Println(result)
 	// Output:
 	// {"!INVALID":"value"}
-
 }
